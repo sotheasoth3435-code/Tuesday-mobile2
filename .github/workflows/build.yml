@@ -1,0 +1,71 @@
+name: Build TUESDAY APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:   # lets you trigger manually from GitHub UI
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    steps:
+      # 1. Checkout your code
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      # 2. Set up Python
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 3. Install system dependencies Buildozer needs
+      - name: Install system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            git zip unzip openjdk-17-jdk \
+            python3-pip autoconf libtool pkg-config \
+            zlib1g-dev libncurses5-dev libncursesw5-dev \
+            libtinfo5 cmake libffi-dev libssl-dev \
+            ccache
+
+      # 4. Install Buildozer + Cython
+      - name: Install Buildozer
+        run: |
+          pip install --upgrade pip
+          pip install buildozer cython
+
+      # 5. Write your GITHUB_TOKEN into the .env file so the APK can use it
+      - name: Write .env
+        run: |
+          echo "GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN_AI }}" > .env
+        # NOTE: In your GitHub repo go to:
+        # Settings → Secrets → Actions → New repository secret
+        # Name: GITHUB_TOKEN_AI   Value: your_github_token_here
+
+      # 6. Build the APK (this takes ~15 min first time, faster after cache)
+      - name: Build APK with Buildozer
+        run: |
+          yes | buildozer android debug 2>&1 | tee build.log
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+
+      # 7. Upload the APK as a downloadable artifact
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tuesday-mobile-apk
+          path: bin/*.apk
+          retention-days: 14
+
+      # 8. Upload build log in case anything goes wrong
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          retention-days: 7
