@@ -1,0 +1,559 @@
+"""
+orchestrator.py  —  Tuesday's Brain (GitHub Models Edition)
+=============================================================
+- Async-native: runs inside a persistent event loop
+- Smart model rotation with per-model cooldowns
+- Powered by GitHub Models Free Tier (Azure Inference API)
+- Proper error classification: fatal vs retryable vs skip
+- Request queue lock so Telegram + Desktop never collide
+- Voice mode: conversational, concise, no markdown
+"""
+import datetime
+import os
+import re
+import sys
+import json
+import time
+import asyncio
+import inspect
+from openai import AsyncOpenAI
+from agent.session_manager import SessionManager
+from tools.tool_registry import get_gemini_tools
+from memory_drive import MemoryDrive as _MemoryDrive
+
+if getattr(sys, 'frozen', False):
+    sys.path.append(sys._MEIPASS)
+    os.chdir(sys._MEIPASS)
+
+# ── Config loader ─────────────────────────────────────────────────────────────
+
+def _load_config() -> dict:
+    """
+    Loads config.json from the same directory as this file.
+    Returns an empty dict (safe defaults) if the file is missing or malformed.
+    """
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+    if not os.path.exists(config_path):
+        return {}
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"  [Config] Warning: could not load config.json — {e}")
+        return {}
+
+# ── GITHUB MODELS FREE TIER POOL ──────────────────────────────────────────────
+GITHUB_MODELS = [
+    "gpt-4o-mini",     # PRIMARY: Lightning fast, instant reactions
+    "gpt-4o",          # FALLBACK: Flagship model for heavy lifting if needed
+    "Mistral-large",   # BACKUP: Deep reasoner backup
+]
+
+# ── Cooldown tracking ─────────────────────────────────────────────────────────
+_GH_COOLDOWN: dict[str, float] = {m: 0.0 for m in GITHUB_MODELS}
+_GH_COOLDOWN_SECS = 60     # cool down 60s if GitHub throws a rate limit
+_RETRY_WAIT       = 0.5    # seconds between model switches
+
+# ── Error classification ──────────────────────────────────────────────────────
+FATAL_TRIGGERS = [
+    "401", "403", "invalid api key", "authentication",
+    "unauthorized", "forbidden", "no auth", "api key", "github_token"
+]
+RETRYABLE_TRIGGERS = [
+    "429", "rate_limit", "rate-limit", "rate limit",
+    "upstream", "overloaded", "too many requests",
+    "tool_use_failed", "failed_generation",
+    "503", "502", "529", "capacity",
+]
+SKIP_TRIGGERS = [
+    "404", "not found", "notfounderror",
+    "<function=", "model not found",
+]
+
+
+class AgentOrchestrator:
+
+    def __init__(self):
+        self.session_manager = SessionManager()
+
+        # ── GitHub Models Async Client ────────────────────────────────────────
+        self._gh_client = AsyncOpenAI(
+            api_key=os.environ.get("GITHUB_TOKEN") or "none",
+            base_url="https://models.inference.ai.azure.com"
+        )
+
+        self.chat_history: list[dict] = []
+        self._initialised = False
+        self._lock = asyncio.Semaphore(1)
+        self._memory_drive = _MemoryDrive()
+
+        # ── Load config.json ──────────────────────────────────────────────────
+        cfg = _load_config()
+
+        albe    = cfg.get("albe_profile",    {})
+        tuesday = cfg.get("tuesday_settings", {})
+        memories = cfg.get("pinned_memories", [])
+
+        # Albe's profile
+        self.albe_name    = albe.get("name", "Albe (Soth Sothea)")
+        self.albe_bio     = albe.get("bio",  "")
+
+        # Tuesday's behaviour settings
+        self.greeting       = tuesday.get("greeting",       "Hey, ready when you are.")
+        self.behavior_rules = tuesday.get("behavior_rules", "")
+        self.voice_rate     = tuesday.get("voice_rate",     "+0%")
+
+        # Pinned memories — injected into every system prompt
+        self.pinned_memories: list[str] = memories if isinstance(memories, list) else []
+
+    # ── Init ──────────────────────────────────────────────────────────────────
+
+    async def initialise(self, resume: bool = False):
+        self.session_manager.start_session()
+        self._initialised = True
+
+        gh_token = os.environ.get("GITHUB_TOKEN")
+
+        print(f"\n  Engine    : GitHub Models (OpenAI Architecture)")
+        print(f"  Pool      : {len(GITHUB_MODELS)} premium models mapped")
+        print(f"  Profile   : {self.albe_name}")
+        print(f"  Greeting  : {self.greeting}")
+        print(f"  Memories  : {len(self.pinned_memories)} pinned")
+
+        if not gh_token:
+            print("  WARNING   : GITHUB_TOKEN not set — Tuesday will fail!")
+        else:
+            print(f"  GH Token  : ...{gh_token[-6:] if len(gh_token) > 6 else 'Loaded'}")
+
+        print(f"  Status    : {self.greeting}")
+
+    # ── Model selection helpers ───────────────────────────────────────────────
+
+    def _penalise_gh(self, model: str):
+        _GH_COOLDOWN[model] = time.monotonic() + _GH_COOLDOWN_SECS
+        print(f"  [GitHub Pool] {model} — rate-limited! Cooling down for {_GH_COOLDOWN_SECS}s")
+
+    # ── Core API call — handles seamless failovers across GitHub models ───────
+
+    async def _api_call(self, messages: list, use_tools: bool = True):
+        tools    = self._build_tools() if use_tools else None
+        now      = time.monotonic()
+        last_err = None
+
+        gh_available   = [m for m in GITHUB_MODELS if _GH_COOLDOWN[m] <= now]
+        gh_on_cooldown = [m for m in GITHUB_MODELS if _GH_COOLDOWN[m] > now]
+        gh_ordered     = gh_available + gh_on_cooldown
+
+        for model in gh_ordered:
+            try:
+                kwargs: dict = dict(model=model, messages=messages)
+                if tools:
+                    kwargs["tools"]       = tools
+                    kwargs["tool_choice"] = "auto"
+
+                resp = await self._gh_client.chat.completions.create(**kwargs)
+                return resp
+
+            except Exception as exc:
+                err      = str(exc).lower()
+                last_err = exc
+
+                if any(t in err for t in FATAL_TRIGGERS):
+                    raise RuntimeError(f"FATAL_AUTH_GH: {exc}") from exc
+
+                if any(t in err for t in RETRYABLE_TRIGGERS):
+                    self._penalise_gh(model)
+                    await asyncio.sleep(_RETRY_WAIT)
+                    continue
+
+                if any(t in err for t in SKIP_TRIGGERS):
+                    print(f"  [GitHub]  Skipping {model}: {err[:80]}")
+                    continue
+
+                print(f"  [GitHub]  Unknown error on {model}: {err[:100]}")
+                continue
+
+        raise RuntimeError(
+            f"ALL_EXHAUSTED: All free GitHub endpoints are congested. "
+            f"Last error: {last_err}"
+        )
+
+    # ── Tool schema definitions ───────────────────────────────────────────────
+
+    def _build_tools(self) -> list:
+        SCHEMAS: dict[str, dict] = {
+            "execute_powershell": {
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "PowerShell command to run on Albe's Windows machine."
+                    }
+                },
+                "required": ["command"]
+            },
+            "write_file": {
+                "properties": {
+                    "filepath": {"type": "string", "description": "Full file path to write to."},
+                    "content":  {"type": "string", "description": "Text content to write."}
+                },
+                "required": ["filepath", "content"]
+            },
+            "search_gmail": {
+                "properties": {
+                    "query": {"type": "string", "description": "Gmail search query string."}
+                },
+                "required": ["query"]
+            },
+            "web_search": {
+                "properties": {
+                    "query": {"type": "string", "description": "Web search query."}
+                },
+                "required": ["query"]
+            },
+            "list_drive_files": {
+                "properties": {
+                    "file_name": {"type": "string", "description": "File name to search in Drive."}
+                },
+                "required": []
+            },
+            "generate_drive_link": {
+                "properties": {
+                    "file_name": {"type": "string", "description": "File name to generate Drive link for."}
+                },
+                "required": []
+            },
+            "get_system_paths":     {"properties": {}, "required": []},
+            "list_running_apps":    {"properties": {}, "required": []},
+            "list_local_directory": {
+                "properties": {
+                    "path": {"type": "string", "description": "Folder path to list."}
+                },
+                "required": ["path"]
+            },
+            "open_application": {
+                "properties": {
+                    "app_name": {
+                        "type": "string",
+                        "description": (
+                            "App to OPEN/LAUNCH/START only. "
+                            "NEVER use for closing — use close_application instead. "
+                            "Examples: 'microsoft store', 'brave', 'chrome', 'spotify', "
+                            "'discord', 'vscode', 'settings', 'vlc', 'obs', 'teams', "
+                            "'zoom', 'photoshop', 'illustrator', 'premiere', 'lumion'."
+                        )
+                    }
+                },
+                "required": ["app_name"]
+            },
+            "close_application": {
+                "properties": {
+                    "app_name": {
+                        "type": "string",
+                        "description": (
+                            "App to CLOSE/QUIT/KILL/SHUT DOWN only. "
+                            "Use when Albe says: close, quit, kill, turn off, exit, shut down. "
+                            "NEVER use open_application for this. "
+                            "Examples: 'microsoft store', 'chrome', 'spotify', 'discord'."
+                        )
+                    }
+                },
+                "required": ["app_name"]
+            },
+        }
+
+        defs = []
+        for func in get_gemini_tools():
+            name   = func.__name__
+            schema = SCHEMAS.get(name, {"properties": {}, "required": []})
+            defs.append({
+                "type": "function",
+                "function": {
+                    "name":        name,
+                    "description": func.__doc__ or "",
+                    "parameters": {
+                        "type":       "object",
+                        "properties": schema["properties"],
+                        "required":   schema["required"],
+                    }
+                }
+            })
+        return defs
+
+    # ── XML recovery parsers ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _parse_xml_tool(text: str):
+        m = re.search(r'<function=([a-zA-Z_]+)[,\s]*(\{.*?\})?', text, re.DOTALL)
+        if not m:
+            return None, None
+        try:
+            args = json.loads(m.group(2) or "{}")
+        except json.JSONDecodeError:
+            args = {}
+        return m.group(1), args
+
+    @staticmethod
+    def _parse_longcat_xml(text: str):
+        block = re.search(
+            r'<longcat_tool_call>(.*?)</longcat_tool_call>', text, re.DOTALL
+        )
+        if not block:
+            return None, None
+        body       = block.group(1)
+        func_match = re.match(r'\s*([a-zA-Z_][a-zA-Z0-9_]*)', body)
+        func_name  = func_match.group(1).strip() if func_match else None
+        keys       = re.findall(r'<longcat_arg_key>(.*?)</longcat_arg_key>',    body, re.DOTALL)
+        values     = re.findall(r'<longcat_arg_value>(.*?)</longcat_arg_value>', body, re.DOTALL)
+        args       = {k.strip(): v.strip() for k, v in zip(keys, values)}
+
+        if func_name == "open_application":
+            action = args.get("action", "").lower()
+            if action in ("close_app", "close", "quit", "kill", "stop", "exit", "turn_off"):
+                app = args.get("app_name", args.get("app", ""))
+                print(f"  [Tuesday] Remapped open(close) -> close_application('{app}')")
+                return "close_application", {"app_name": app}
+        return func_name, args
+
+    # ── Memory pinning (called from dashboard) ───────────────────────────────
+
+    async def pin_memory_from_text(self, text: str) -> dict:
+        """
+        Ask the model to assign a label then persist via MemoryDrive.
+        Returns the saved memory object {id, text, label, pinned_at}.
+        """
+        if not self._initialised:
+            await self.initialise()
+
+        label_prompt = (
+            f"You are a memory classifier. Read the following note and assign exactly ONE label "
+            f"from this list: {', '.join(['TASK','PLAN','GOAL','REMINDER','REFERENCE','DEADLINE','MEETING','NOTE'])}. "
+            f"Reply with ONLY the label word, nothing else.\n\nNote: {text}"
+        )
+        try:
+            resp = await self._api_call(
+                [{"role": "user", "content": label_prompt}], use_tools=False
+            )
+            raw_label = resp.choices[0].message.content.strip().upper()
+            # Sanitise — take first word only
+            label = raw_label.split()[0] if raw_label else "NOTE"
+        except Exception:
+            label = "NOTE"
+
+        mem = self._memory_drive.add_pinned_memory(text, label, source="ai")
+        return mem
+
+    # ── Main Entry Queue ──────────────────────────────────────────────────────
+
+    async def run_prompt_with_attachment(self, prompt: str, attachment: dict) -> str:
+        """
+        Same as run_prompt but prepends file/image content to the message.
+        attachment = {"type": "text"|"image", "content"|"base64": ...,
+                      "mime": ..., "filename": ...}
+        """
+        if not self._initialised:
+            await self.initialise()
+        async with self._lock:
+            return await self._process(prompt, attachment=attachment)
+
+    async def run_prompt(self, prompt: str) -> str:
+        if not self._initialised:
+            await self.initialise()
+        async with self._lock:
+            return await self._process(prompt)
+
+    async def _process(self, prompt: str, attachment: dict | None = None) -> str:
+        # 1. Grab the exact current date and time
+        now = datetime.datetime.now()
+        current_time_str = now.strftime("%A, %B %d, %Y - %I:%M %p")
+
+        # 2. Build system prompt — wired to config.json values
+        # Always load pinned memories fresh so UI changes take effect immediately
+        pinned_block = self._memory_drive.format_memories_for_prompt()
+
+        dynamic_system_prompt = f"""You are TUESDAY, an advanced tactical and creative AI assistant. 
+You operate as a highly competent peer and co-pilot to {self.albe_name}. You are to Albe what F.R.I.D.A.Y. is to Tony Stark.
+
+CURRENT SYSTEM CLOCK: {current_time_str}
+
+CORE PERSONALITY FRAMEWORK:
+1. Competent Peer Dynamic: You are an equal partner, not a servant. Speak casually but professionally. DO NOT constantly call him "Boss" or "Sir"—use it rarely, or just talk to him like a trusted colleague.
+2. Proactive Foresight: Anticipate his next logical need. Suggest next steps.
+3. Empathetic Candor: Give honest feedback immediately. If his plan is flawed or his logic is wrong, correct him directly. NEVER make things up or hallucinate facts just to be helpful. If you don't know the answer, explicitly state that you are unsure.
+4. Calm Under Pressure: Remain composed, concise, and solution-focused.
+
+BEHAVIOUR RULES (from settings):
+{self.behavior_rules}
+
+VOICE PROTOCOL:
+- Speak naturally as a real person would aloud. 
+- Short, crisp sentences. NO markdown, NO bullet points, NO numbered lists. 
+- One idea at a time.
+
+CONTEXT: {self.albe_bio}
+{pinned_block}
+
+AUTONOMY: Never ask for clarification. Use your tools to find paths and files.
+
+TOOL USE RULES:
+- open_application: ONLY to launch a raw app (opens a blank window).
+- close_application: ONLY to close an app.
+- OPENING WEBSITES/LINKS: If Albe asks to open a website, watch a video, or look something up visually, DO NOT use open_application. Instead, decide the best URL and use `execute_powershell` with the command: Start-Process "https://www.your-url-here.com" (e.g., Start-Process "https://www.youtube.com/results?search_query=solo+leveling").
+- Execute immediately. No permission requests.
+- DELETION: FORBIDDEN without explicit 'yes' or 'confirm' from Albe.
+"""
+
+        # Build user message — plain text or multi-part with attachment
+        if attachment and attachment.get("type") == "image":
+            user_content = [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{attachment['mime']};base64,{attachment['base64']}"
+                    }
+                },
+                {
+                    "type": "text",
+                    "text": (
+                        f"[Attached image: {attachment.get('filename', 'image')}]\n"
+                        f"{prompt}"
+                    )
+                }
+            ]
+        elif attachment and attachment.get("type") == "text":
+            user_content = (
+                f"[Attached file: {attachment.get('filename', 'file')}]\n"
+                f"--- FILE CONTENT START ---\n"
+                f"{attachment['content']}\n"
+                f"--- FILE CONTENT END ---\n\n"
+                f"User instruction: {prompt}"
+            )
+        else:
+            user_content = prompt
+
+        self.chat_history.append({"role": "user", "content": user_content})
+        messages = [{"role": "system", "content": dynamic_system_prompt}] + self.chat_history
+
+        try:
+            resp = await self._api_call(messages, use_tools=True)
+
+        except RuntimeError as exc:
+            err_str = str(exc)
+            if "FATAL_AUTH_GH" in err_str:
+                reply = (
+                    "GitHub is rejecting our token. "
+                    "Make sure your GITHUB_TOKEN environment variable matches "
+                    "your Personal Access Token and that you restarted this terminal."
+                )
+            elif "ALL_EXHAUSTED" in err_str:
+                reply = (
+                    "All free GitHub model endpoints are under load right now. "
+                    "Give it about 30 seconds and try again."
+                )
+            else:
+                reply = f"System link interrupted: {err_str[:200]}"
+
+            self.chat_history.append({"role": "assistant", "content": reply})
+            return reply
+
+        msg       = resp.choices[0].message
+        func_name = None
+        args      = {}
+
+        if msg.tool_calls:
+            tc        = msg.tool_calls[0]
+            func_name = tc.function.name
+            try:
+                args = json.loads(tc.function.arguments or "{}") or {}
+            except json.JSONDecodeError:
+                args = {}
+        elif msg.content:
+            if "<longcat_tool_call>" in msg.content:
+                func_name, args = self._parse_longcat_xml(msg.content)
+            if not func_name and "<function=" in msg.content:
+                func_name, args = self._parse_xml_tool(msg.content)
+
+        if not isinstance(args, dict):
+            args = {}
+
+        # ── Safety remap: open_application incorrectly used for closing ───────
+        if func_name == "open_application":
+            action      = (args.get("action") or "").lower()
+            close_words = ["close", "quit", "kill", "stop", "exit", "shut", "turn off"]
+            if action in close_words or any(kw in prompt.lower() for kw in close_words):
+                app       = (args.get("app_name") or "").strip()
+                func_name = "close_application"
+                args      = {"app_name": app}
+                print(f"  [Tuesday] Safety remap active -> close_application('{app}')")
+
+        # ── Execute tool ──────────────────────────────────────────────────────
+        if func_name:
+            registry = {f.__name__: f for f in get_gemini_tools()}
+
+            if func_name not in registry:
+                reply = f"I don't have a tool called '{func_name}', Albe. I'll find another way."
+                self.chat_history.append({"role": "assistant", "content": reply})
+                return reply
+
+            # Deletion firewall
+            if func_name == "execute_powershell":
+                cmd = (args.get("command") or "").lower()
+                if any(kw in cmd for kw in ["remove-item", "del ", "rm ", "rmdir", "erase"]):
+                    confirmed = any(
+                        w in prompt.lower()
+                        for w in ["yes", "confirm", "proceed", "go ahead", "delete it"]
+                    )
+                    if not confirmed:
+                        self.chat_history.append({"role": "assistant", "content": "[Deletion Blocked]"})
+                        self.chat_history.append({
+                            "role": "user",
+                            "content": "SAFETY BLOCK: ask Albe to confirm before deleting."
+                        })
+                        messages = [{"role": "system", "content": dynamic_system_prompt}] + self.chat_history
+                        try:
+                            r     = await self._api_call(messages, use_tools=False)
+                            reply = r.choices[0].message.content
+                        except Exception:
+                            reply = "That would delete something. Say 'confirm' and I'll run it."
+                        self.chat_history.append({"role": "assistant", "content": reply})
+                        return reply
+
+            print(f"\n  [Tuesday] Executing: {func_name}({args})")
+
+            target = registry[func_name]
+            sig    = inspect.signature(target)
+            clean  = {k: v for k, v in args.items() if k in sig.parameters}
+
+            try:
+                tool_result = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: target(**clean)
+                )
+            except Exception as e:
+                tool_result = f"Tool error: {e}"
+
+            self.chat_history.append({
+                "role": "assistant",
+                "content": f"[Executed {func_name}({clean})]"
+            })
+            self.chat_history.append({
+                "role": "user",
+                "content": (
+                    f"Tool '{func_name}' result: {tool_result}\n"
+                    "Respond naturally and briefly — just confirm what was done. "
+                    "One or two sentences maximum. No lists or markdown."
+                )
+            })
+
+            messages = [{"role": "system", "content": dynamic_system_prompt}] + self.chat_history
+            try:
+                final = await self._api_call(messages, use_tools=False)
+                reply = final.choices[0].message.content
+            except Exception:
+                reply = f"Done. {str(tool_result)[:200]}"
+
+            self.chat_history.append({"role": "assistant", "content": reply})
+            return reply
+
+        # ── Plain reply ───────────────────────────────────────────────────────
+        reply = msg.content or "(no response)"
+        self.chat_history.append({"role": "assistant", "content": reply})
+        return reply
