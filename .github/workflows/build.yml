@@ -53,14 +53,15 @@ jobs:
         env:
           ANDROID_HOME: /usr/local/lib/android/sdk
 
-      # 7. Upload the APK as a downloadable artifact
+     # 7. Upload the APK or AAB as a downloadable artifact
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: tuesday-mobile-apk
-          path: bin/*.apk
+          path: |
+            **/*.apk
+            **/*.aab
           retention-days: 14
-
       # 8. Upload build log in case anything goes wrong
       - name: Upload build log
         if: always()
