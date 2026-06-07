@@ -46,9 +46,10 @@ jobs:
         # Settings → Secrets → Actions → New repository secret
         # Name: GITHUB_TOKEN_AI   Value: your_github_token_here
 
-      # 6. Build the APK (this takes ~15 min first time, faster after cache)
+     # 6. Build the APK (this takes ~15 min first time, faster after cache)
       - name: Build APK with Buildozer
         run: |
+          set -eo pipefail
           yes | buildozer android debug 2>&1 | tee build.log
         env:
           ANDROID_HOME: /usr/local/lib/android/sdk
