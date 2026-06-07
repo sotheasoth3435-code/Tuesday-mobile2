@@ -1,0 +1,23 @@
+# TUESDAY Mobile — .gitignore
+
+# Never commit your token
+.env
+
+# Buildozer output
+bin/
+.buildozer/
+build.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Kivy cache
+.kivy/
+
+# OS
+.DS_Store
+Thumbs.db
